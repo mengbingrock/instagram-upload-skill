@@ -1,0 +1,2 @@
+playwright>=1.49
+browser-cookie3>=0.20  # only needed for import_from_chrome.py
