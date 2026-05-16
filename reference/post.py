@@ -59,25 +59,92 @@ def _safe_screenshot(page: Page | None, dst: str | None) -> None:
         _log(f"screenshot failed: {e}")
 
 
+def _dismiss_info_overlays(page: Page) -> int:
+    """Dismiss one-time informational dialogs Instagram pops up ON TOP of the
+    upload modal (e.g., "Video posts are now shared as reels"). Identifies
+    them by distinctive text content + an OK-style primary button.
+
+    Distinct from `_dismiss_modals`, which targets nag dialogs on the main
+    page (login save / notifications / cookies) and skips itself when the
+    upload modal is open.
+    """
+    dismissed = 0
+    info_cases = [
+        # (text fragment inside the dialog, primary button label)
+        ("shared as reels", "OK"),
+        ("Video posts are now", "OK"),
+        ("Original audio", "OK"),
+        ("New feature", "OK"),
+        ("you can now", "OK"),
+        ("New: Edit captions", "Got it"),
+    ]
+    for text_match, btn_label in info_cases:
+        # Case-insensitive substring match
+        dialog = page.locator(
+            f'[role="dialog"]:has-text("{text_match}")'
+        ).first
+        try:
+            if dialog.count() == 0 or not dialog.is_visible():
+                continue
+        except Exception:
+            continue
+        # Skip if this dialog is the upload modal itself (has a file input or
+        # the canonical wizard step labels in the header).
+        try:
+            if dialog.locator('input[type="file"]').count() > 0:
+                continue
+            header_text = (dialog.inner_text(timeout=500) or "")[:200].lower()
+            if any(s in header_text for s in ("crop", "edit", "create new post", "share")):
+                # Still let through if the matching info-text is also present
+                # (rare). Compare lengths: info dialogs are short.
+                if len(header_text) > 500:
+                    continue
+        except Exception:
+            pass
+
+        btn = dialog.get_by_role("button", name=btn_label, exact=True).first
+        if not _is_visible(btn):
+            btn = dialog.locator(f'button:has-text("{btn_label}")').first
+        if _is_visible(btn):
+            try:
+                btn.click(timeout=2000)
+                dismissed += 1
+                page.wait_for_timeout(600)
+            except Exception:
+                pass
+    return dismissed
+
+
 def _dismiss_modals(page: Page) -> int:
     """Best-effort: dismiss Instagram nag dialogs ("Save login info?", "Turn
-    on notifications", "Add to home screen") that overlay the page."""
+    on notifications", "Add to home screen") that overlay the page.
+
+    Does NOT touch the upload-flow dialog. The upload dialog has a file input
+    or its title is the wizard step name — gate on that to skip dismissal.
+    """
+    # If the upload modal is in flight (dialog contains a file input OR has the
+    # wizard title), do nothing.
+    upload_dialog_open = (
+        page.locator('[role="dialog"] input[type="file"]').count() > 0
+        or page.locator('[role="dialog"]:has-text("Create new post")').count() > 0
+        or page.locator('[role="dialog"]:has-text("Crop")').count() > 0
+        or page.locator('[role="dialog"]:has-text("Edit")').count() > 0
+    )
+    if upload_dialog_open:
+        return 0
+
     dismissed = 0
-    button_texts = [
-        "Not now", "Not Now", "Cancel",
-        "Save info", "Save Info",  # avoid — these are positive actions, but listed for awareness
-        "Maybe later", "Skip",
-        "Got it", "OK", "Okay", "Continue",
-        "Accept all", "Accept", "I agree", "Allow", "Close",
-        "Decline optional cookies", "Allow all cookies", "Allow essential and optional cookies",
+    # Negative-action buttons only — never click positive-confirmation text like "OK"
+    # or "Allow" here, because those would opt the user into something. "Close" is
+    # excluded because Instagram's upload modal close icon uses that label.
+    safe_buttons = [
+        "Not now", "Not Now",
         "No thanks", "Dismiss",
+        "Decline optional cookies",
+        "Skip", "Maybe later",
+        "Cancel",
     ]
-    # Prefer "Not now" / "Cancel" / "Dismiss" type buttons over positive actions.
-    safe_first = ["Not now", "Not Now", "Cancel", "No thanks", "Dismiss",
-                  "Decline optional cookies", "Close", "Skip", "Maybe later"]
-    rest = [t for t in button_texts if t not in safe_first]
-    ordered = safe_first + rest
-    for txt in ordered:
+    for txt in safe_buttons:
         btn = page.get_by_role("button", name=txt, exact=True)
         if btn.count() > 0 and btn.first.is_visible():
             try:
@@ -97,42 +164,72 @@ def _is_visible(loc: Locator) -> bool:
 
 
 def _open_create_dialog(page: Page) -> None:
-    """Open Instagram's "Create new post" dialog. Tries several selectors
-    because IG ships layout variants across viewports."""
-    candidates = [
-        # Sidebar / nav button
-        'a[href$="/create/select/"]',
-        '[role="link"][aria-label="New post"]',
-        '[role="button"][aria-label="New post"]',
-        'svg[aria-label="New post"]',
-        # Mobile-web "plus" icon
-        '[aria-label="Create"]',
-    ]
-    for sel in candidates:
-        loc = page.locator(sel).first
-        if _is_visible(loc):
-            _log(f"clicking new-post trigger: {sel}")
+    """Open Instagram's "Create new post" upload modal.
+
+    Direct nav to /create/select/ FAILS because Instagram's SPA routing falls
+    through to the user-profile lookup for "create" (there's a real user
+    @create). The reliable path is to click the sidebar's Create button —
+    which opens a sub-menu — then click the Post sub-option using its
+    accessibility name (`href="#"`, SPA-only action).
+    """
+    # Step 1: click the sidebar Create button
+    create_trigger = page.locator(
+        'a:has(svg[aria-label="New post"]), '
+        'div[role="link"]:has(svg[aria-label="New post"]), '
+        'div[role="button"]:has(svg[aria-label="New post"])'
+    ).first
+    if not _is_visible(create_trigger):
+        raise RuntimeError("Could not find Create button in sidebar")
+    _log("clicking sidebar Create")
+    create_trigger.click(timeout=5_000)
+
+    # Step 2: wait for the Post sub-option to become visible, then click it.
+    # The sub-menu is an `<a href="#">Post</a>` (SPA-only action). We iterate
+    # over matches and pick the first VISIBLE one — get_by_role(exact=True)
+    # sometimes misses if the computed accessible name has surrounding
+    # whitespace or includes an icon's label.
+    _log("waiting for Post sub-option to be visible")
+    post_option = None
+    candidates = page.locator('a[href="#"]:has-text("Post")')
+    deadline = page.context.browser  # placeholder for type
+    import time as _t
+    end = _t.time() + 10
+    while _t.time() < end:
+        n = candidates.count()
+        for i in range(n):
+            c = candidates.nth(i)
             try:
-                # Some matches are SVGs — click the ancestor button
-                loc.click(timeout=5_000)
-                page.wait_for_timeout(800)
-                return
-            except Exception as e:
-                _log(f"  trigger click failed: {e}")
+                if c.is_visible() and (c.inner_text() or "").strip() == "Post":
+                    post_option = c
+                    break
+            except Exception:
                 continue
-    # Last resort: try the modal-open URL (works in some IG variants)
-    _log("falling back to /create/select/ direct nav")
-    page.goto("https://www.instagram.com/create/select/", wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
+        if post_option is not None:
+            break
+        page.wait_for_timeout(300)
+    if post_option is None:
+        raise RuntimeError("Could not find Post sub-option after clicking Create")
+    _log("clicking Post sub-option")
+    post_option.click(timeout=5_000)
+
+    # Wait for the upload dialog to appear (it contains a file input)
+    _log("waiting for upload dialog to open")
+    page.wait_for_selector(
+        '[role="dialog"] input[type="file"]',
+        state="attached",
+        timeout=15_000,
+    )
 
 
 def _find_file_input(page: Page) -> Locator:
     """Instagram's file input is hidden inside the modal; setInputFiles works
-    on hidden inputs."""
+    on hidden inputs. Scope inside [role="dialog"] to avoid matching stale
+    inputs left on the home page."""
     for sel in [
-        'input[type="file"][accept*="image"]',
-        'input[type="file"][accept*="video"]',
-        'input[type="file"]',
+        '[role="dialog"] input[type="file"][accept*="image"]',
+        '[role="dialog"] input[type="file"][accept*="video"]',
+        '[role="dialog"] input[type="file"]',
+        'input[type="file"]',  # last-resort unscoped fallback
     ]:
         loc = page.locator(sel).first
         try:
@@ -178,14 +275,28 @@ def _click_button_in_modal(page: Page, name_re: re.Pattern) -> bool:
     return False
 
 
-def _advance_wizard_and_post(page: Page, caption: str, max_steps: int = 8) -> None:
+def _advance_wizard_and_post(page: Page, caption: str,
+                              max_steps: int = 15, step_sleep_s: int = 5,
+                              debug_screenshots_dir: str | None = None) -> None:
     """Loop: dismiss modals, then either click Next or (if Share is reachable)
-    type caption + click Share."""
+    type caption + click Share. Waits step_sleep_s seconds between iterations
+    to give Instagram time for upload + transcode (which can take ~60 s)."""
     typed_caption = False
     for step in range(1, max_steps + 1):
         _dismiss_modals(page)
+        n_info = _dismiss_info_overlays(page)
+        if n_info:
+            _log(f"dismissed {n_info} info overlay(s) blocking the upload modal")
 
-        # If Share is visible AND we haven't typed yet, type caption first.
+        if debug_screenshots_dir:
+            try:
+                page.screenshot(
+                    path=f"{debug_screenshots_dir}/ig-wizard-{step:02d}.png",
+                    full_page=False,
+                )
+            except Exception:
+                pass
+
         share_btn = page.get_by_role("button", name=SHARE_BUTTON_RE).first
         if not _is_visible(share_btn):
             share_btn = page.locator(f'div[role="button"]:text-matches("{SHARE_BUTTON_RE.pattern}", "i")').first
@@ -211,13 +322,11 @@ def _advance_wizard_and_post(page: Page, caption: str, max_steps: int = 8) -> No
             return
 
         # Otherwise click Next.
-        _log(f"step {step}: clicking Next")
-        if not _click_button_in_modal(page, NEXT_BUTTON_RE):
-            # No Next visible either — modal may not be in a wizard state yet.
-            _log("  no Next button visible; sweeping modals and waiting")
-            page.wait_for_timeout(1500)
-            continue
-        page.wait_for_timeout(1500)
+        if _click_button_in_modal(page, NEXT_BUTTON_RE):
+            _log(f"step {step}: clicked Next, waiting {step_sleep_s}s for next view")
+        else:
+            _log(f"step {step}: no Next/Share visible (upload still processing?)")
+        page.wait_for_timeout(step_sleep_s * 1000)
     raise RuntimeError(f"wizard did not reach Share after {max_steps} steps")
 
 
@@ -274,19 +383,35 @@ def post_media(
             # Some accounts get an "OK" / "Continue" confirmation prompt for video format.
             _dismiss_modals(page)
 
-            _advance_wizard_and_post(page, caption)
+            import tempfile, os as _os
+            dbg_dir = tempfile.mkdtemp(prefix="ig-wizard-")
+            _log(f"per-step screenshots → {dbg_dir}")
+            _advance_wizard_and_post(page, caption, debug_screenshots_dir=dbg_dir)
 
-            _log("waiting for confirmation (modal close or success toast)")
-            # IG returns either a "Your post has been shared" toast or just closes
-            # the modal. We wait for the modal to disappear.
+            _log("waiting for confirmation (success dialog or modal close)")
+            # IG signals success either by closing the upload modal or by
+            # popping a confirmation dialog containing "shared" text (e.g.,
+            # "Reel shared", "Your post has been shared"). Treat either as success.
             try:
                 page.wait_for_function(
-                    "() => !document.querySelector('div[role=\"dialog\"]')",
+                    """() => {
+                      const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
+                      // Success: any dialog confirms the share
+                      const success = dialogs.some(d => /shared|posted/i.test(d.innerText || ""));
+                      if (success) return true;
+                      // Or: no upload-wizard dialog is open anymore
+                      const wizardOpen = dialogs.some(d => {
+                        const t = (d.innerText || "").toLowerCase();
+                        return t.includes("create new post") || t.includes("crop")
+                          || t.includes("edit") || d.querySelector("input[type='file']");
+                      });
+                      return !wizardOpen;
+                    }""",
                     timeout=180_000,
                 )
-                _log("modal closed — post likely succeeded")
+                _log("post confirmed (success dialog or modal closed)")
             except PWTimeout:
-                _log("modal still open after 180s; check the screenshot")
+                _log("no confirmation after 180s; check the screenshot")
 
             page.wait_for_timeout(2000)
             result["post_url"] = page.url
