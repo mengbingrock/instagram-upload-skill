@@ -275,18 +275,72 @@ def _click_button_in_modal(page: Page, name_re: re.Pattern) -> bool:
     return False
 
 
+def _select_aspect_ratio(page: Page, candidates: tuple[str, ...]) -> bool:
+    """On the crop screen, open Instagram's crop menu and pick the first
+    aspect-ratio option whose label matches one of `candidates` (in order).
+    Returns True only if a ratio was actually selected. Safe to call on any
+    screen — returns False when the crop button isn't present (e.g. still
+    processing, or already past the crop step)."""
+    crop_btn = page.locator('[aria-label="Select crop"]').first
+    if not _is_visible(crop_btn):
+        return False
+    try:
+        crop_btn.click(timeout=4_000)
+    except Exception:
+        return False
+    page.wait_for_timeout(1200)
+    # Select the option by exact (case-insensitive) button text via the DOM —
+    # Instagram's option buttons are role=button divs that Playwright's
+    # visibility checks handle unreliably while the popover animates in. Poll a
+    # few times because the options render slightly after the popover opens.
+    for _ in range(6):
+        picked = page.evaluate(
+            """(labels) => {
+              const btns = Array.from(document.querySelectorAll(
+                'div[role="dialog"] [role="button"], div[role="dialog"] button'));
+              for (const label of labels) {
+                const el = btns.find(b =>
+                  (b.innerText || '').trim().toLowerCase() === label.toLowerCase());
+                if (el) { el.click(); return label; }
+              }
+              return null;
+            }""",
+            list(candidates),
+        )
+        if picked:
+            _log(f"selected aspect ratio: {picked}")
+            page.wait_for_timeout(600)
+            return True
+        page.wait_for_timeout(600)
+    _log("crop menu open but no matching ratio label found; leaving default")
+    # Close the popover so it can't intercept the Next button.
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    return False
+
+
 def _advance_wizard_and_post(page: Page, caption: str,
                               max_steps: int = 15, step_sleep_s: int = 5,
-                              debug_screenshots_dir: str | None = None) -> None:
-    """Loop: dismiss modals, then either click Next or (if Share is reachable)
-    type caption + click Share. Waits step_sleep_s seconds between iterations
-    to give Instagram time for upload + transcode (which can take ~60 s)."""
+                              debug_screenshots_dir: str | None = None,
+                              aspect_ratio: tuple[str, ...] = ("Original", "9:16")) -> None:
+    """Loop: dismiss modals, optionally pick the crop aspect ratio (once, on the
+    crop screen), then either click Next or (if Share is reachable) type caption
+    + click Share. Waits step_sleep_s seconds between iterations to give
+    Instagram time for upload + transcode (which can take ~60 s)."""
     typed_caption = False
+    picked_ratio = not aspect_ratio  # skip if no candidates requested
     for step in range(1, max_steps + 1):
         _dismiss_modals(page)
         n_info = _dismiss_info_overlays(page)
         if n_info:
             _log(f"dismissed {n_info} info overlay(s) blocking the upload modal")
+
+        # Pick the aspect ratio on the crop screen, before advancing past it.
+        if not picked_ratio:
+            if _select_aspect_ratio(page, aspect_ratio):
+                picked_ratio = True
 
         if debug_screenshots_dir:
             try:
@@ -388,32 +442,55 @@ def post_media(
             _log(f"per-step screenshots → {dbg_dir}")
             _advance_wizard_and_post(page, caption, debug_screenshots_dir=dbg_dir)
 
-            _log("waiting for confirmation (success dialog or modal close)")
-            # IG signals success either by closing the upload modal or by
-            # popping a confirmation dialog containing "shared" text (e.g.,
-            # "Reel shared", "Your post has been shared"). Treat either as success.
+            _log("waiting for confirmation (sharing to complete)")
+            # After clicking Share, IG shows a "Sharing..." spinner dialog. The
+            # post is NOT published until either an explicit success dialog
+            # ("Reel shared" / "Your post has been shared") appears, OR every
+            # dialog has closed back to the feed. A dialog that merely lost its
+            # wizard text but is still showing the spinner is STILL IN PROGRESS
+            # — closing the browser then aborts the upload. So we keep waiting
+            # while any "Sharing" spinner / progressbar is present, and never
+            # treat the transient spinner state as success.
+            shared = False
             try:
                 page.wait_for_function(
                     """() => {
                       const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
-                      // Success: any dialog confirms the share
-                      const success = dialogs.some(d => /shared|posted/i.test(d.innerText || ""));
-                      if (success) return true;
-                      // Or: no upload-wizard dialog is open anymore
-                      const wizardOpen = dialogs.some(d => {
-                        const t = (d.innerText || "").toLowerCase();
-                        return t.includes("create new post") || t.includes("crop")
-                          || t.includes("edit") || d.querySelector("input[type='file']");
-                      });
-                      return !wizardOpen;
+                      // Fully closed back to the feed → done.
+                      if (dialogs.length === 0) return true;
+                      const txt = dialogs.map(d => (d.innerText || "")).join(" ");
+                      // Explicit success confirmation from IG.
+                      if (/shared|posted/i.test(txt)) return true;
+                      // Otherwise (wizard still open, or "Sharing..." spinner /
+                      // progressbar still visible) → keep waiting.
+                      return false;
                     }""",
                     timeout=180_000,
                 )
-                _log("post confirmed (success dialog or modal closed)")
+                shared = True
+                _log("share completed (confirmation seen or modal fully closed)")
             except PWTimeout:
                 _log("no confirmation after 180s; check the screenshot")
 
-            page.wait_for_timeout(2000)
+            # Give IG a moment to finish the server-side publish and let any
+            # "Sharing"/success dialog auto-dismiss before we tear the browser
+            # down — closing too early is what silently drops the post.
+            if shared:
+                try:
+                    page.wait_for_function(
+                        """() => {
+                          const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
+                          if (dialogs.length === 0) return true;
+                          const txt = dialogs.map(d => (d.innerText || "")).join(" ").toLowerCase();
+                          // Wait until the "Sharing..." spinner is gone.
+                          return !txt.includes("sharing");
+                        }""",
+                        timeout=45_000,
+                    )
+                except PWTimeout:
+                    pass
+                page.wait_for_timeout(6000)
+
             result["post_url"] = page.url
             _safe_screenshot(page, screenshot_path)
 
